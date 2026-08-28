@@ -87,14 +87,8 @@ $$\text{TDS} = 1.3 \times A + 0.1 \times B + 0.5 \times C + 0.5 \times D$$
 
 ---
 
-## 🎓 Viva & Defense Q&A
-
-* **Q: Why use Attention Gates over Standard Skip Connections?**  
-  *A: Standard skip connections copy all spatial features indiscriminately, passing background noise and artifacts to the decoder. Attention Gates use a gating signal from deeper layers to dynamically weight features, focusing computation on the lesion area.*
-
-* **Q: How does the agent operate autonomously?**  
-  *A: It uses the ReAct (Reasoning + Action) pattern. It first reasons about the image, invokes the segmentation tool, calls the morphological biomarker extractor, checks model epistemic uncertainty via Monte Carlo Dropout, and synthesizes the findings into a clinical triage summary.*
-
+Model Weights: Due to the large size of the trained PyTorch model (best_attention_unet.pth), the model weights are hosted separately rather than being included in this repository. Please download the model from the link provided below and place it in the root project directory to run MedVision Agent successfully.
+https://drive.google.com/file/d/1TdurudJ2T7RkQ9g5vTmZwbZERBdKlsYF/view?usp=sharing
 ---
 
 ## 📄 License
