@@ -1,12 +1,16 @@
-﻿import io
+import io
 import os
 import datetime
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image, ImageFilter
 import cv2
 from fpdf import FPDF
+
+from dataset import HAM10000_CLASSES, HAM10000_CLASS_INFO, IDX_TO_CLASS
+
 
 class SyntheticDermoscopyGenerator:
     """Procedural skin lesion generator with realistic pigment networks, hairs, and vignette."""
@@ -53,11 +57,11 @@ class SyntheticDermoscopyGenerator:
         lesion_g = np.random.randint(40, 85)
         lesion_b = np.random.randint(30, 70)
         lesion_layer = np.full((h, w, 3), [lesion_r, lesion_g, lesion_b], dtype=np.uint8)
-        
+
         dist_transform = cv2.distanceTransform(mask_binary, cv2.DIST_L2, 5)
         max_d = dist_transform.max() if dist_transform.max() > 0 else 1
         dist_norm = (dist_transform / max_d)[:, :, np.newaxis]
-        
+
         dark_pigment = np.full((h, w, 3), [lesion_r // 2, lesion_g // 2, lesion_b // 2], dtype=np.uint8)
         blended_lesion = (lesion_layer * (1 - dist_norm * 0.5) + dark_pigment * (dist_norm * 0.5)).astype(np.uint8)
 
@@ -78,8 +82,50 @@ class SyntheticDermoscopyGenerator:
 
         return composite, (mask_binary > 0).astype(np.float32)
 
-def extract_biomarkers(image_np, mask_np):
-    """ABCD Clinical Rule calculation (Stolz Algorithm)"""
+
+def classify_ham10000_lesion(model, image_tensor):
+    """
+    Runs the Multi-Task Attention U-Net 7-Class HAM10000 Diagnostic Head
+    and returns predicted class metadata, confidence, top-3 differentials, and probabilities.
+    """
+    model.eval()
+    with torch.no_grad():
+        _, cls_logits = model(image_tensor, return_classification=True)
+        probs = F.softmax(cls_logits, dim=1).cpu().numpy()[0]
+
+    pred_idx = int(np.argmax(probs))
+    pred_code = IDX_TO_CLASS.get(pred_idx, "nv")
+    info = HAM10000_CLASS_INFO[pred_code]
+
+    prob_dict = {
+        cls_code: round(float(probs[idx]) * 100.0, 2)
+        for idx, cls_code in enumerate(HAM10000_CLASSES)
+    }
+    sorted_classes = sorted(prob_dict.items(), key=lambda x: x[1], reverse=True)
+    top3 = [
+        {
+            "code": c,
+            "name": HAM10000_CLASS_INFO[c]["name"],
+            "prob_pct": p,
+            "malignancy": HAM10000_CLASS_INFO[c]["malignancy"]
+        }
+        for c, p in sorted_classes[:3]
+    ]
+
+    return {
+        "predicted_code": pred_code,
+        "predicted_name": info["name"],
+        "malignancy": info["malignancy"],
+        "risk_tier": info["risk_tier"],
+        "clinical_action": info["clinical_action"],
+        "confidence_pct": round(float(probs[pred_idx]) * 100.0, 1),
+        "probabilities": prob_dict,
+        "top3_differential": top3
+    }
+
+
+def extract_biomarkers(image_np, mask_np, ham10000_pred=None):
+    """ABCD Clinical Rule calculation (Stolz Algorithm) combined with HAM10000 pathology risk."""
     binary_mask = (mask_np > 0.5).astype(np.uint8)
     total_pixels = binary_mask.size
     lesion_pixels = np.sum(binary_mask)
@@ -146,6 +192,16 @@ def extract_biomarkers(image_np, mask_np):
         risk_level = "High Risk / Malignant Suspected"
         recommendation = "Urgent histopathological biopsy and dermatological oncology consult recommended."
 
+    # Integrate HAM10000 7-class pathology classification if high-risk malignancy detected
+    if ham10000_pred is not None:
+        pred_code = ham10000_pred.get("predicted_code", "")
+        if pred_code in ("mel", "bcc") and risk_level == "Benign / Low Risk":
+            risk_level = "Suspicious / Moderate-High Risk"
+            recommendation = f"HAM10000 classifier detected {ham10000_pred['predicted_name']} pattern. {ham10000_pred['clinical_action']}"
+        elif pred_code == "akiec" and risk_level == "Benign / Low Risk":
+            risk_level = "Suspicious / Moderate Risk"
+            recommendation = ham10000_pred["clinical_action"]
+
     return {
         "area_pixels": int(lesion_pixels),
         "area_percentage": round(float(area_pct), 2),
@@ -157,6 +213,7 @@ def extract_biomarkers(image_np, mask_np):
         "risk_level": risk_level,
         "recommendation": recommendation
     }
+
 
 def estimate_uncertainty(model, image_tensor, num_samples=6):
     """Monte Carlo Dropout for epistemic uncertainty estimation."""
@@ -194,13 +251,13 @@ def estimate_uncertainty(model, image_tensor, num_samples=6):
         "edge_uncertainty": round(edge_uncertainty, 4)
     }
 
+
 def compare_longitudinal_scans(img1, mask1, img2, mask2, bio1, bio2):
     """
     Feature 1: Longitudinal Lesion Tracking (Evolution / 'E' in ABCDE).
     Compares baseline scan (Month 0) vs follow-up scan (Month 6),
-    supports custom uploaded scans and synthetic samples.
+    supports custom uploaded scans, HAM10000 scans, and synthetic samples.
     """
-    # Resize to identical dimensions if needed
     if img1.shape[:2] != (256, 256):
         img1 = cv2.resize(img1, (256, 256))
     if img2.shape[:2] != (256, 256):
@@ -257,22 +314,23 @@ def compare_longitudinal_scans(img1, mask1, img2, mask2, bio1, bio2):
         "regressed_pixels": int(np.sum(regressed))
     }
 
-def generate_pdf_report(img_np, mask_np, overlay_np, bio, unc, patient_id="PAT-2026-8891"):
-    """Hospital-Grade One-Click PDF Diagnostic Report Export."""
+
+def generate_pdf_report(img_np, mask_np, overlay_np, bio, unc, cls_res=None, patient_id="PAT-2026-8891"):
+    """Hospital-Grade One-Click PDF Diagnostic Report Export with HAM10000 7-Class Classification."""
     pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
     pdf.set_fill_color(15, 118, 110)
     pdf.rect(0, 0, 210, 24, "F")
-    
+
     pdf.set_font("Helvetica", "B", 16)
     pdf.set_text_color(255, 255, 255)
     pdf.set_xy(10, 6)
-    pdf.cell(190, 8, "MedVision AI - Dermatological Triage Report", align="L")
+    pdf.cell(190, 8, "MedVision AI - HAM10000 Dermatological Triage Report", align="L")
     pdf.set_font("Helvetica", "I", 9)
     pdf.set_xy(10, 14)
-    pdf.cell(190, 6, "Automated Attention-Guided Segmentation & ABCDE Clinical Diagnostic Summary", align="L")
+    pdf.cell(190, 6, "Multi-Task Attention U-Net Segmentation, HAM10000 7-Class Taxonomy & ABCDE Summary", align="L")
 
     pdf.set_text_color(30, 41, 59)
     pdf.set_font("Helvetica", "B", 10)
@@ -280,7 +338,7 @@ def generate_pdf_report(img_np, mask_np, overlay_np, bio, unc, patient_id="PAT-2
     curr_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     pdf.cell(95, 6, f"Patient Case ID: {patient_id}", align="L")
     pdf.cell(95, 6, f"Date & Time: {curr_date}", align="R")
-    
+
     pdf.set_draw_color(203, 213, 225)
     pdf.line(10, 36, 200, 36)
 
@@ -357,24 +415,35 @@ def generate_pdf_report(img_np, mask_np, overlay_np, bio, unc, patient_id="PAT-2
 
     pdf.set_xy(10, 162)
     pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(190, 6, "3. Clinical Triage & Actionable Recommendation", ln=True)
+    pdf.cell(190, 6, "3. HAM10000 7-Class Diagnostic Classification & Clinical Triage", ln=True)
 
     pdf.set_xy(10, 170)
     pdf.set_fill_color(248, 250, 252)
     pdf.set_draw_color(15, 118, 110)
     pdf.set_font("Helvetica", "", 9)
-    reco_text = f"Risk Classification: {bio['risk_level']}\nProtocol Recommendation: {bio['recommendation']}\nQuality Assurance: Attention U-Net suppressed artifacts with {unc['confidence_score']}% boundary precision."
+    ham_line = ""
+    if cls_res is not None:
+        ham_line = (
+            f"HAM10000 Primary Diagnosis: {cls_res['predicted_name']} ({cls_res['predicted_code'].upper()}) "
+            f"[{cls_res['confidence_pct']}% prob] - {cls_res['malignancy']}\n"
+        )
+    reco_text = (
+        f"{ham_line}"
+        f"Risk Classification: {bio['risk_level']}\n"
+        f"Protocol Recommendation: {bio['recommendation']}\n"
+        f"Quality Assurance: Attention U-Net (HAM10000 trained) suppressed artifacts with {unc['confidence_score']}% boundary precision."
+    )
     pdf.multi_cell(190, 5, reco_text, border=1, fill=True)
 
-    pdf.set_xy(10, 210)
+    pdf.set_xy(10, 215)
     pdf.set_font("Helvetica", "B", 9)
-    pdf.cell(95, 5, "Attending Physician / Radiologist:", ln=False)
+    pdf.cell(95, 5, "Attending Physician / Dermatologist:", ln=False)
     pdf.cell(95, 5, "Digital AI System Verification:", ln=True)
 
     pdf.set_font("Helvetica", "", 9)
-    pdf.set_xy(10, 225)
+    pdf.set_xy(10, 228)
     pdf.cell(95, 5, "Signature: ___________________________", ln=False)
-    pdf.cell(95, 5, "MedVision-Agent Engine v2.0 (Verified)", ln=True)
+    pdf.cell(95, 5, "MedVision-Agent HAM10000 Engine v3.0 (Verified)", ln=True)
 
     pdf_buffer = io.BytesIO()
     pdf_bytes = pdf.output()

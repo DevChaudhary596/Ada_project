@@ -1,6 +1,7 @@
-﻿import torch
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 
 class DoubleConv(nn.Module):
     """(Convolution -> BatchNorm -> ReLU) * 2 with optional Dropout"""
@@ -20,6 +21,7 @@ class DoubleConv(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+
 
 class AttentionGate(nn.Module):
     """
@@ -53,10 +55,26 @@ class AttentionGate(nn.Module):
         alpha = self.psi(psi)
         return x * alpha, alpha
 
+
 class AttentionUNet(nn.Module):
-    """Attention U-Net Architecture (Oktay et al., 2018)"""
-    def __init__(self, in_channels=3, out_channels=1, features=[32, 64, 128, 256], dropout_rate=0.1):
+    """
+    Multi-Task Attention U-Net Architecture (Oktay et al., 2018) trained on HAM10000.
+    Simultaneously performs:
+      1. Pixel-wise lesion segmentation via Attention-Gated skip connections.
+      2. 7-Class HAM10000 diagnostic classification (akiec, bcc, bkl, df, mel, nv, vasc)
+         using attention-weighted multi-scale encoder & bottleneck features.
+    """
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=1,
+        num_classes=7,
+        features=[32, 64, 128, 256],
+        dropout_rate=0.15
+    ):
         super(AttentionUNet, self).__init__()
+        self.num_classes = num_classes
+        self.features = features
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
         self.enc1 = DoubleConv(in_channels, features[0], dropout_rate=0.0)
@@ -84,7 +102,29 @@ class AttentionUNet(nn.Module):
 
         self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
 
-    def forward(self, x, return_attention=False):
+        # Multi-scale HAM10000 7-class diagnostic classification head
+        # Combines pooled bottleneck (2*F3), attention-gated e4 (F3), and attention-gated e3 (F2)
+        cls_in_dim = (features[3] * 2) * 2 + features[3] + features[2]
+        self.classifier = nn.Sequential(
+            nn.Linear(cls_in_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.25),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.15),
+            nn.Linear(128, num_classes)
+        )
+
+    def _compute_cls_logits(self, b, x4, x3):
+        b_avg = F.adaptive_avg_pool2d(b, (1, 1)).flatten(1)
+        b_max = F.adaptive_max_pool2d(b, (1, 1)).flatten(1)
+        x4_avg = F.adaptive_avg_pool2d(x4, (1, 1)).flatten(1)
+        x3_avg = F.adaptive_avg_pool2d(x3, (1, 1)).flatten(1)
+        feat = torch.cat([b_avg, b_max, x4_avg, x3_avg], dim=1)
+        return self.classifier(feat)
+
+    def forward(self, x, return_attention=False, return_classification=False):
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
@@ -110,15 +150,25 @@ class AttentionUNet(nn.Module):
 
         out = self.final_conv(d1)
 
+        cls_logits = self._compute_cls_logits(b, x4, x3) if return_classification else None
+
         if return_attention:
             a1_upsampled = F.interpolate(a1, size=x.shape[2:], mode='bilinear', align_corners=True)
-            return out, {"ag1": a1_upsampled, "ag2": a2, "ag3": a3, "ag4": a4}
+            att_dict = {"ag1": a1_upsampled, "ag2": a2, "ag3": a3, "ag4": a4}
+            if return_classification:
+                return out, cls_logits, att_dict
+            return out, att_dict
+
+        if return_classification:
+            return out, cls_logits
         return out
 
+
 class UNet(nn.Module):
-    """Baseline U-Net Architecture (Ronneberger et al., 2015)"""
-    def __init__(self, in_channels=3, out_channels=1, features=[32, 64, 128, 256]):
+    """Baseline Multi-Task U-Net Architecture (Ronneberger et al., 2015) for HAM10000 Ablation"""
+    def __init__(self, in_channels=3, out_channels=1, num_classes=7, features=[32, 64, 128, 256]):
         super(UNet, self).__init__()
+        self.num_classes = num_classes
         self.downs = nn.ModuleList()
         self.ups = nn.ModuleList()
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
@@ -136,14 +186,26 @@ class UNet(nn.Module):
 
         self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
 
-    def forward(self, x):
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(features[-1] * 2, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.2),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x, return_classification=False):
         skips = []
         for down in self.downs:
             x = down(x)
             skips.append(x)
             x = self.pool(x)
 
-        x = self.bottleneck(x)
+        b = self.bottleneck(x)
+        cls_logits = self.classifier(b) if return_classification else None
+
+        x = b
         skips = skips[::-1]
 
         for idx in range(0, len(self.ups), 2):
@@ -153,4 +215,78 @@ class UNet(nn.Module):
                 x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=True)
             x = self.ups[idx + 1](torch.cat((skip, x), dim=1))
 
-        return self.final_conv(x)
+        out = self.final_conv(x)
+        if return_classification:
+            return out, cls_logits
+        return out
+
+
+class DiceBCELoss(nn.Module):
+    """Hybrid Dice + Binary Cross-Entropy Loss for Medical Image Segmentation"""
+    def __init__(self, dice_weight=0.6, bce_weight=0.4, smooth=1.0):
+        super(DiceBCELoss, self).__init__()
+        self.dice_weight = dice_weight
+        self.bce_weight = bce_weight
+        self.smooth = smooth
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, logits, targets):
+        bce_loss = self.bce(logits, targets)
+        probs = torch.sigmoid(logits)
+        probs_flat = probs.view(probs.size(0), -1)
+        targets_flat = targets.view(targets.size(0), -1)
+
+        intersection = (probs_flat * targets_flat).sum(dim=1)
+        dice_score = (2.0 * intersection + self.smooth) / (
+            probs_flat.sum(dim=1) + targets_flat.sum(dim=1) + self.smooth
+        )
+        dice_loss = 1.0 - dice_score.mean()
+        return self.bce_weight * bce_loss + self.dice_weight * dice_loss
+
+
+class MultiTaskHAM10000Loss(nn.Module):
+    """
+    Joint Segmentation (Hybrid Dice + BCE) and 7-Class HAM10000 Diagnostic
+    Classification (Class-Weighted Label-Smoothed Cross-Entropy) Loss.
+    """
+    def __init__(self, class_weights=None, seg_weight=1.0, cls_weight=0.5, label_smoothing=0.05):
+        super(MultiTaskHAM10000Loss, self).__init__()
+        self.seg_loss_fn = DiceBCELoss(dice_weight=0.6, bce_weight=0.4)
+        self.cls_loss_fn = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=label_smoothing
+        )
+        self.seg_weight = seg_weight
+        self.cls_weight = cls_weight
+
+    def forward(self, seg_logits, cls_logits, mask_targets, label_targets):
+        loss_seg = self.seg_loss_fn(seg_logits, mask_targets)
+        loss_cls = self.cls_loss_fn(cls_logits, label_targets)
+        total_loss = self.seg_weight * loss_seg + self.cls_weight * loss_cls
+        return total_loss, loss_seg, loss_cls
+
+
+def compute_segmentation_metrics(seg_logits, mask_targets, threshold=0.5, eps=1e-7):
+    """Computes batch-averaged Dice (DSC), IoU (Jaccard), Precision, and Recall."""
+    with torch.no_grad():
+        preds = (torch.sigmoid(seg_logits) > threshold).float()
+        targets = (mask_targets > 0.5).float()
+
+        p_flat = preds.view(preds.size(0), -1)
+        t_flat = targets.view(targets.size(0), -1)
+
+        tp = (p_flat * t_flat).sum(dim=1)
+        fp = (p_flat * (1.0 - t_flat)).sum(dim=1)
+        fn = ((1.0 - p_flat) * t_flat).sum(dim=1)
+
+        dice = ((2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)).mean().item()
+        iou = ((tp + eps) / (tp + fp + fn + eps)).mean().item()
+        precision = ((tp + eps) / (tp + fp + eps)).mean().item()
+        recall = ((tp + eps) / (tp + fn + eps)).mean().item()
+
+    return {
+        "dice": dice,
+        "iou": iou,
+        "precision": precision,
+        "recall": recall
+    }

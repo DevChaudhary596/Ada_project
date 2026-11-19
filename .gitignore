@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+data/HAM10000/images/
+data/HAM10000/masks/
+data/HAM10000/local_manifest.csv
+best_baseline_unet.pth
